@@ -1,0 +1,28 @@
+# Бот + свой сервер Telegram Bot API (лимит на файл 2 ГБ вместо 50 МБ).
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "1"  # разрешает файлы до 2 ГБ и отправку по пути на диске
+    volumes:
+      - bot-api-data:/var/lib/telegram-bot-api
+      - downloads:/downloads  # та же папка, что у бота, по тому же пути
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      BOT_API_URL: http://telegram-bot-api:8081
+      DOWNLOAD_DIR: /downloads
+    volumes:
+      - downloads:/downloads
+    depends_on:
+      - telegram-bot-api
+
+volumes:
+  bot-api-data:
+  downloads:

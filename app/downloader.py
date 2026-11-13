@@ -4,9 +4,11 @@ import asyncio
 import logging
 import shutil
 import sys
+import math
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError as YtDlpError
@@ -23,6 +25,9 @@ SKIP_EXT = {".part", ".ytdl", ".json", ".txt", ".temp"}
 
 GALLERY_DL_TIMEOUT = 300
 MAX_ITEMS = 20
+
+# progress(downloaded_bytes, total_bytes | None) — вызывается из потока yt-dlp.
+ProgressCallback = Callable[[int, int | None], None]
 
 
 class DownloadError(Exception):
@@ -48,6 +53,7 @@ class DownloadResult:
     files: list[MediaFile] = field(default_factory=list)
     title: str | None = None
     via_ytdlp: bool = False
+    split: bool = False  # большой файл разрезан на части
 
     def cleanup(self) -> None:
         shutil.rmtree(self.workdir, ignore_errors=True)
@@ -90,7 +96,9 @@ class _QuietLogger:
         log.debug("yt-dlp: %s", msg)
 
 
-def _ytdlp_opts(workdir: Path, audio: bool, max_height: int) -> dict:
+def _ytdlp_opts(
+    workdir: Path, audio: bool, max_height: int, progress: ProgressCallback | None
+) -> dict:
     opts: dict = {
         "outtmpl": str(workdir / "%(id).60s_%(autonumber)s.%(ext)s"),
         "restrictfilenames": True,
@@ -102,8 +110,15 @@ def _ytdlp_opts(workdir: Path, audio: bool, max_height: int) -> dict:
         "socket_timeout": 30,
         "retries": 3,
         "concurrent_fragment_downloads": 4,
-        "max_filesize": config.MAX_UPLOAD_BYTES * 3,
+        "max_filesize": config.MAX_DOWNLOAD_BYTES,
     }
+    if progress:
+        def hook(d: dict) -> None:
+            if d.get("status") == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                progress(int(d.get("downloaded_bytes") or 0), int(total) if total else None)
+
+        opts["progress_hooks"] = [hook]
     if config.COOKIES_FILE:
         opts["cookiefile"] = config.COOKIES_FILE
 
@@ -126,8 +141,10 @@ def _meta_by_id(info: dict) -> dict[str, dict]:
     return {str(e.get("id")): e for e in entries if e}
 
 
-def _run_ytdlp(url: str, workdir: Path, audio: bool, max_height: int) -> DownloadResult:
-    with YoutubeDL(_ytdlp_opts(workdir, audio, max_height)) as ydl:
+def _run_ytdlp(
+    url: str, workdir: Path, audio: bool, max_height: int, progress: ProgressCallback | None
+) -> DownloadResult:
+    with YoutubeDL(_ytdlp_opts(workdir, audio, max_height, progress)) as ydl:
         info = ydl.extract_info(url, download=True)
     if not info:
         raise DownloadError("yt-dlp ничего не вернул")
@@ -180,12 +197,17 @@ def _new_workdir() -> Path:
     return path
 
 
-async def download(url: str, audio: bool = False, max_height: int = 1080) -> DownloadResult:
+async def download(
+    url: str,
+    audio: bool = False,
+    max_height: int = 1080,
+    progress: ProgressCallback | None = None,
+) -> DownloadResult:
     """Скачивает медиа по ссылке. Сначала yt-dlp, при неудаче — gallery-dl (только не для аудио)."""
     workdir = _new_workdir()
     try:
         try:
-            return await asyncio.to_thread(_run_ytdlp, url, workdir, audio, max_height)
+            return await asyncio.to_thread(_run_ytdlp, url, workdir, audio, max_height, progress)
         except (YtDlpError, DownloadError) as e:
             log.info("yt-dlp failed for %s: %s", url, e)
             if audio:
@@ -203,3 +225,68 @@ async def download(url: str, audio: bool = False, max_height: int = 1080) -> Dow
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
+
+
+# ---------------------------------------------------------------- нарезка больших файлов
+
+async def _run(*cmd: str) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode or 0, out.decode(errors="ignore")
+
+
+async def probe_duration(path: Path) -> float | None:
+    code, out = await _run(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    )
+    try:
+        return float(out.strip()) if code == 0 else None
+    except ValueError:
+        return None
+
+
+async def split_media(f: MediaFile, limit: int) -> list[MediaFile]:
+    """Режет видео/аудио на части не больше limit байт (по ключевым кадрам, без перекодирования).
+
+    Каждая часть — самостоятельный файл, который нормально проигрывается.
+    """
+    duration = await probe_duration(f.path)
+    if not duration:
+        raise DownloadError(f"Не удалось определить длительность {f.path.name}")
+
+    parts: list[Path] = []
+    # Части режутся по ключевым кадрам и выходят неравными, поэтому берём запас
+    # и при необходимости повторяем с более короткими кусками.
+    for target_ratio in (0.85, 0.65, 0.45):
+        for p in parts:
+            p.unlink(missing_ok=True)
+        n_parts = max(2, math.ceil(f.size / (limit * target_ratio)))
+        segment = max(1, int(duration / n_parts))
+        pattern = f.path.with_name(f"{f.path.stem}_part%03d{f.path.suffix}")
+        code, out = await _run(
+            "ffmpeg", "-v", "error", "-y", "-i", str(f.path),
+            "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-f", "segment",
+            "-segment_time", str(segment), "-reset_timestamps", "1",
+            *(["-segment_format_options", "movflags=+faststart"] if f.kind == "video" else []),
+            str(pattern),
+        )
+        if code != 0:
+            raise DownloadError(f"ffmpeg не смог разрезать файл: {out[-300:]}")
+        parts = sorted(f.path.parent.glob(f"{f.path.stem}_part*{f.path.suffix}"))
+        if parts and all(p.stat().st_size <= limit for p in parts):
+            break
+    else:
+        raise DownloadError("Не удалось разрезать файл на части нужного размера")
+
+    f.path.unlink(missing_ok=True)
+    result = []
+    for p in parts:
+        part_duration = await probe_duration(p)
+        result.append(MediaFile(
+            path=p, kind=f.kind, width=f.width, height=f.height,
+            duration=int(part_duration) if part_duration else None,
+        ))
+    return result

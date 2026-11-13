@@ -3,7 +3,9 @@ import html
 import logging
 import re
 import secrets
+import time
 from collections import OrderedDict
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -23,7 +25,7 @@ from aiogram.types import (
 )
 
 from . import config
-from .downloader import DownloadError, DownloadResult, MediaFile, download
+from .downloader import DownloadError, DownloadResult, MediaFile, download, split_media
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +36,8 @@ HELP_TEXT = (
     "Поддерживаются TikTok, Instagram, YouTube, Pinterest, X/Twitter, VK, "
     "Reddit, SoundCloud и ещё сотни сайтов.\n\n"
     "Под каждым видео есть кнопка «🎵 Аудио» — она пришлёт звук в mp3.\n"
-    "Команда /audio &lt;ссылка&gt; — сразу скачать mp3."
+    "Команда /audio &lt;ссылка&gt; — сразу скачать mp3.\n\n"
+    "Большие видео (фильмы) я присылаю частями."
 )
 
 dp = Dispatcher()
@@ -60,22 +63,127 @@ def audio_keyboard(url: str) -> InlineKeyboardMarkup:
     )
 
 
-def short_caption(result: DownloadResult) -> str | None:
+def short_title(result: DownloadResult, limit: int = 200) -> str | None:
     if not result.title:
         return None
     title = result.title.strip()
-    title = title if len(title) <= 200 else title[:197] + "…"
-    return html.escape(title)
+    return title if len(title) <= limit else title[: limit - 1] + "…"
 
 
-def human_size(n: int) -> str:
-    return f"{n / 1024 / 1024:.1f} МБ"
+def human_size(n: float) -> str:
+    if n >= 1024**3:
+        return f"{n / 1024**3:.2f} ГБ"
+    return f"{n / 1024**2:.1f} МБ"
+
+
+def input_file(path: Path) -> FSInputFile | str:
+    # Локальный сервер Bot API читает файл прямо с диска — без загрузки по HTTP.
+    if config.BOT_API_LOCAL_FILES:
+        return path.resolve().as_uri()
+    return FSInputFile(path)
+
+
+# ---------------------------------------------------------------- статус и прогресс
+
+class Status:
+    """Сообщение «Скачиваю…», которое обновляется не чаще раза в несколько секунд."""
+
+    def __init__(self, message: Message):
+        self.message = message
+        self.downloaded = 0
+        self.total: int | None = None
+        self._last_text = ""
+        self._task: asyncio.Task | None = None
+
+    def on_progress(self, downloaded: int, total: int | None) -> None:
+        # Вызывается из потока yt-dlp — только сохраняем значения.
+        self.downloaded, self.total = downloaded, total
+
+    async def set(self, text: str) -> None:
+        if text == self._last_text:
+            return
+        self._last_text = text
+        try:
+            await self.message.edit_text(text)
+        except TelegramBadRequest:
+            pass
+
+    async def _loop(self) -> None:
+        start = time.monotonic()
+        while True:
+            await asyncio.sleep(4)
+            if not self.downloaded:
+                continue
+            text = f"⏬ Скачиваю… {human_size(self.downloaded)}"
+            if self.total:
+                pct = min(100, self.downloaded * 100 // self.total)
+                text += f" из {human_size(self.total)} ({pct}%)"
+            speed = self.downloaded / max(1, time.monotonic() - start)
+            text += f"\n⚡ {human_size(speed)}/с"
+            await self.set(text)
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop())
+
+    def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
 
 
 # ---------------------------------------------------------------- отправка
 
-async def send_result(message: Message, result: DownloadResult, url: str, audio: bool) -> None:
-    caption = short_caption(result)
+async def split_big_files(result: DownloadResult, status: Status) -> None:
+    files: list[MediaFile] = []
+    for f in result.files:
+        if f.size > config.MAX_UPLOAD_BYTES and f.kind in ("video", "audio"):
+            await status.set(f"✂️ Файл {human_size(f.size)} — режу на части…")
+            files.extend(await split_media(f, config.MAX_UPLOAD_BYTES))
+            result.split = True
+        else:
+            files.append(f)
+    result.files = files
+
+
+async def send_video(message: Message, f: MediaFile, caption: str | None, markup=None) -> None:
+    await message.answer_chat_action(ChatAction.UPLOAD_VIDEO)
+    await message.answer_video(
+        input_file(f.path),
+        caption=caption,
+        width=f.width,
+        height=f.height,
+        duration=f.duration,
+        supports_streaming=True,
+        reply_markup=markup,
+    )
+
+
+async def send_audio(message: Message, f: MediaFile, title: str | None, caption: str | None) -> None:
+    await message.answer_chat_action(ChatAction.UPLOAD_VOICE)
+    await message.answer_audio(
+        input_file(f.path),
+        title=title[:64] if title else None,
+        caption=caption,
+        duration=f.duration,
+    )
+
+
+async def send_parts(message: Message, result: DownloadResult, files: list[MediaFile]) -> None:
+    """Фильм/длинное аудио, разрезанное на части: шлём по одной с подписью «Часть N/M»."""
+    title = short_title(result, 150)
+    total = len(files)
+    for i, f in enumerate(files, 1):
+        caption = f"🎞 Часть {i}/{total}"
+        if title:
+            caption = f"{html.escape(title)}\n{caption}"
+        if f.kind == "video":
+            await send_video(message, f, caption)
+        else:
+            await send_audio(message, f, f"{title or 'audio'} ({i}/{total})", caption)
+
+
+async def send_result(message: Message, result: DownloadResult, url: str) -> None:
+    title = short_title(result)
+    caption = html.escape(title) if title else None
     too_big = [f for f in result.files if f.size > config.MAX_UPLOAD_BYTES]
     files = [f for f in result.files if f.size <= config.MAX_UPLOAD_BYTES]
 
@@ -85,57 +193,46 @@ async def send_result(message: Message, result: DownloadResult, url: str, audio:
             f"лимит Telegram — {human_size(config.MAX_UPLOAD_BYTES)}."
         )
 
+    if result.split:
+        await send_parts(message, result, files)
+        return
+
     groupable = [
         f for f in files
         if f.kind == "video" or (f.kind == "photo" and f.size <= config.MAX_PHOTO_BYTES)
     ]
     others = [f for f in files if f not in groupable]
 
-    # Одиночное видео — с кнопкой «Аудио».
     if len(groupable) == 1 and groupable[0].kind == "video":
-        f = groupable[0]
-        await message.answer_chat_action(ChatAction.UPLOAD_VIDEO)
-        await message.answer_video(
-            FSInputFile(f.path),
-            caption=caption,
-            width=f.width,
-            height=f.height,
-            duration=f.duration,
-            supports_streaming=True,
-            reply_markup=audio_keyboard(url) if result.via_ytdlp else None,
-        )
+        # Одиночное видео — с кнопкой «Аудио».
+        markup = audio_keyboard(url) if result.via_ytdlp else None
+        await send_video(message, groupable[0], caption, markup)
     elif len(groupable) == 1:
         await message.answer_chat_action(ChatAction.UPLOAD_PHOTO)
-        await message.answer_photo(FSInputFile(groupable[0].path), caption=caption)
+        await message.answer_photo(input_file(groupable[0].path), caption=caption)
     elif groupable:
         await message.answer_chat_action(ChatAction.UPLOAD_PHOTO)
         for i in range(0, len(groupable), 10):
-            chunk = groupable[i : i + 10]
             media = []
-            for j, f in enumerate(chunk):
+            for j, f in enumerate(groupable[i : i + 10]):
                 cap = caption if i == 0 and j == 0 else None
                 if f.kind == "video":
                     media.append(InputMediaVideo(
-                        media=FSInputFile(f.path), caption=cap, width=f.width,
+                        media=input_file(f.path), caption=cap, width=f.width,
                         height=f.height, duration=f.duration, supports_streaming=True,
                     ))
                 else:
-                    media.append(InputMediaPhoto(media=FSInputFile(f.path), caption=cap))
+                    media.append(InputMediaPhoto(media=input_file(f.path), caption=cap))
             await message.answer_media_group(media)
 
     for f in others:
         if f.kind == "audio":
-            await message.answer_chat_action(ChatAction.UPLOAD_VOICE)
-            await message.answer_audio(
-                FSInputFile(f.path),
-                title=result.title[:64] if result.title else None,
-                duration=f.duration,
-            )
+            await send_audio(message, f, result.title, None)
         elif f.kind == "animation":
-            await message.answer_animation(FSInputFile(f.path))
+            await message.answer_animation(input_file(f.path))
         else:
             await message.answer_chat_action(ChatAction.UPLOAD_DOCUMENT)
-            await message.answer_document(FSInputFile(f.path))
+            await message.answer_document(input_file(f.path))
 
     if too_big:
         await message.answer(f"⚠️ Пропущено файлов из-за размера: {len(too_big)}")
@@ -148,31 +245,29 @@ async def process(message: Message, url: str, audio: bool) -> None:
         return
 
     user_busy.add(user_id)
-    status = await message.answer("⏳ Скачиваю…")
+    status = Status(await message.answer("⏳ Скачиваю…"))
+    result: DownloadResult | None = None
     try:
         async with semaphore:
-            # Если видео не влезает в лимит — пробуем качество ниже.
-            heights = [1080] if audio else ([1080, 720] if config.BOT_API_URL else [720, 480, 360])
-            result: DownloadResult | None = None
+            status.start()
+            # С обычным Bot API (50 МБ) сначала пробуем качество пониже,
+            # с локальным сервером (2 ГБ) качаем в максимальном и режем при необходимости.
+            heights = [config.MAX_HEIGHT] if (audio or config.BOT_API_URL) else [720, 480]
             for h in heights:
                 if result:
                     result.cleanup()
-                result = await download(url, audio=audio, max_height=h)
-                videos = [f for f in result.files if f.kind == "video"]
-                biggest = max((f.size for f in videos), default=0)
-                if biggest <= config.MAX_UPLOAD_BYTES:
+                status.downloaded, status.total = 0, None
+                result = await download(url, audio=audio, max_height=h, progress=status.on_progress)
+                if all(f.size <= config.MAX_UPLOAD_BYTES for f in result.files):
                     break
-                # В разы больше лимита — понижение качества не поможет, не тратим время.
-                if biggest > config.MAX_UPLOAD_BYTES * 4:
-                    break
-                log.info("Too big at %sp, retrying lower", h)
+                log.info("Too big at %sp", h)
+            status.stop()
 
             assert result is not None
-            try:
-                await send_result(message, result, url, audio)
-            finally:
-                result.cleanup()
-        await status.delete()
+            await split_big_files(result, status)
+            await status.set("⏫ Отправляю…")
+            await send_result(message, result, url)
+        await status.message.delete()
     except DownloadError as e:
         log.warning("Download failed: %s — %s", url, e)
         text = str(e)
@@ -181,14 +276,17 @@ async def process(message: Message, url: str, audio: bool) -> None:
                 "❌ Не получилось скачать по этой ссылке.\n"
                 "Проверь, что пост публичный, или попробуй позже."
             )
-        await status.edit_text(text)
+        await status.set(text)
     except TelegramBadRequest as e:
         log.exception("Telegram error for %s", url)
-        await status.edit_text(f"❌ Telegram не принял файл: {e.message}")
+        await status.set(f"❌ Telegram не принял файл: {html.escape(e.message)}")
     except Exception:
         log.exception("Unexpected error for %s", url)
-        await status.edit_text("❌ Что-то пошло не так. Попробуй ещё раз.")
+        await status.set("❌ Что-то пошло не так. Попробуй ещё раз.")
     finally:
+        status.stop()
+        if result:
+            result.cleanup()
         user_busy.discard(user_id)
 
 
@@ -229,20 +327,32 @@ async def on_audio_button(callback: CallbackQuery) -> None:
     await process(callback.message, url, audio=True)
 
 
+def make_bot() -> Bot:
+    if config.BOT_API_URL:
+        session = AiohttpSession(
+            api=TelegramAPIServer.from_base(config.BOT_API_URL, is_local=True),
+            timeout=config.REQUEST_TIMEOUT,
+        )
+    else:
+        session = AiohttpSession(timeout=config.REQUEST_TIMEOUT)
+    return Bot(
+        config.BOT_TOKEN,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if not config.BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан (см. .env.example)")
 
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    session = None
-    if config.BOT_API_URL:
-        session = AiohttpSession(api=TelegramAPIServer.from_base(config.BOT_API_URL, is_local=True))
-
-    bot = Bot(
-        config.BOT_TOKEN,
-        session=session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    bot = make_bot()
+    log.info(
+        "Bot started: api=%s, file limit %s",
+        config.BOT_API_URL or "api.telegram.org", human_size(config.MAX_UPLOAD_BYTES),
     )
-    log.info("Bot started, upload limit %s", human_size(config.MAX_UPLOAD_BYTES))
+    # Не обрабатываем ссылки, накопившиеся пока бот был выключен.
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
