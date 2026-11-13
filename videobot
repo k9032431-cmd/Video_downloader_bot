@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+# Управление Video Downloader Bot.
+#   videobot            — меню
+#   videobot update     — обновить бота и yt-dlp
+#   videobot logs|status|restart|start|stop|config|cookies|uninstall
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ENV_FILE="$APP_DIR/.env"
+DATA_DIR="$APP_DIR/data"
+LINK=/usr/local/bin/videobot
+CRON_FILE=/etc/cron.d/videobot-update
+
+if [[ -t 1 ]]; then
+    R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' B=$'\e[1m' C=$'\e[36m' N=$'\e[0m'
+else
+    R='' G='' Y='' B='' C='' N=''
+fi
+
+info() { echo "${C}➜${N} $*"; }
+ok()   { echo "${G}✔${N} $*"; }
+warn() { echo "${Y}!${N} $*"; }
+die()  { echo "${R}✘ $*${N}" >&2; exit 1; }
+
+# Читаем ввод с терминала даже при запуске через curl | bash.
+ask() {  # ask "Вопрос" [по умолчанию] -> REPLY
+    local prompt="$1" def="${2:-}"
+    if [[ -n "$def" ]]; then prompt+=" ${C}[$def]${N}"; fi
+    read -r -p "$prompt: " REPLY </dev/tty || true
+    REPLY="${REPLY:-$def}"
+}
+
+ask_secret() {
+    read -r -s -p "$1: " REPLY </dev/tty || true
+    echo
+}
+
+confirm() {  # confirm "Вопрос" [y|n]
+    local def="${2:-y}" hint="[Y/n]"
+    [[ "$def" == n ]] && hint="[y/N]"
+    read -r -p "$1 $hint: " REPLY </dev/tty || true
+    REPLY="${REPLY:-$def}"
+    [[ "$REPLY" =~ ^[YyДд] ]]
+}
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "Запусти от root: sudo videobot ${*}"
+}
+
+# ---------------------------------------------------------------- .env
+
+env_get() {
+    [[ -f "$ENV_FILE" ]] || return 0
+    grep -E "^$1=" "$ENV_FILE" | tail -n1 | cut -d= -f2- || true
+}
+
+env_set() {
+    touch "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    local tmp
+    tmp="$(mktemp)"
+    grep -vE "^$1=" "$ENV_FILE" >"$tmp" || true
+    printf '%s=%s\n' "$1" "$2" >>"$tmp"
+    cat "$tmp" >"$ENV_FILE"
+    rm -f "$tmp"
+}
+
+env_unset() {
+    [[ -f "$ENV_FILE" ]] || return 0
+    local tmp
+    tmp="$(mktemp)"
+    grep -vE "^$1=" "$ENV_FILE" >"$tmp" || true
+    cat "$tmp" >"$ENV_FILE"
+    rm -f "$tmp"
+}
+
+compose() {
+    (cd "$APP_DIR" && docker compose "$@")
+}
+
+# ---------------------------------------------------------------- Docker
+
+ensure_docker() {
+    if ! command -v docker >/dev/null 2>&1; then
+        info "Устанавливаю Docker…"
+        curl -fsSL https://get.docker.com | sh
+    fi
+    if ! docker compose version >/dev/null 2>&1; then
+        info "Устанавливаю docker compose…"
+        if command -v apt-get >/dev/null; then
+            apt-get update -qq && apt-get install -y -qq docker-compose-plugin
+        elif command -v dnf >/dev/null; then
+            dnf install -y -q docker-compose-plugin
+        elif command -v yum >/dev/null; then
+            yum install -y -q docker-compose-plugin
+        fi
+    fi
+    docker compose version >/dev/null 2>&1 || die "Не удалось установить docker compose"
+    systemctl enable --now docker >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------- Telegram
+
+tg_get_me() {  # tg_get_me TOKEN -> печатает username или пусто
+    curl -fsS --max-time 15 "https://api.telegram.org/bot$1/getMe" 2>/dev/null \
+        | grep -o '"username":"[^"]*"' | cut -d'"' -f4 || true
+}
+
+tg_logout_official() {
+    # Перед переходом на свой сервер Bot API бот должен выйти с api.telegram.org.
+    curl -fsS --max-time 15 "https://api.telegram.org/bot$1/logOut" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------- настройка
+
+configure() {
+    need_root configure
+    echo
+    echo "${B}⚙  Настройка бота${N}"
+    echo
+
+    # --- токен
+    local old_token token username
+    old_token="$(env_get BOT_TOKEN)"
+    while true; do
+        if [[ -n "$old_token" ]]; then
+            ask_secret "Токен от @BotFather (Enter — оставить текущий)"
+            token="${REPLY:-$old_token}"
+        else
+            ask_secret "Токен от @BotFather"
+            token="$REPLY"
+        fi
+        [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]] || { warn "Это не похоже на токен, попробуй ещё раз"; continue; }
+
+        username="$(tg_get_me "$token")"
+        if [[ -n "$username" ]]; then
+            ok "Бот найден: @$username"
+            break
+        fi
+        # После перехода на свой сервер официальный API бота не видит — это нормально.
+        if [[ "$token" == "$old_token" && "$(env_get LOCAL_API_LOGGED_OUT)" == 1 ]]; then
+            ok "Токен оставлен прежним"
+            break
+        fi
+        warn "Telegram не принял токен (или нет доступа к api.telegram.org)"
+        confirm "Всё равно использовать этот токен?" n && break
+    done
+    env_set BOT_TOKEN "$token"
+    if [[ "$token" != "$old_token" ]]; then env_unset LOCAL_API_LOGGED_OUT; fi
+
+    # --- режим
+    echo
+    echo "Размер файлов, которые бот сможет отправлять:"
+    echo "  ${B}1${N}) до 2 ГБ — свой сервер Bot API ${G}(рекомендуется, для фильмов)${N}"
+    echo "     нужны api_id и api_hash с https://my.telegram.org → API development tools"
+    echo "  ${B}2${N}) до 50 МБ — обычный api.telegram.org, ничего больше не нужно"
+    local cur_mode=1 compose_file
+    compose_file="$(env_get COMPOSE_FILE)"
+    [[ -n "$compose_file" && "$compose_file" != *local-api* ]] && cur_mode=2
+    ask "Выбери режим" "$cur_mode"
+    local mode="$REPLY"
+
+    if [[ "$mode" == 1 ]]; then
+        ask "api_id" "$(env_get TELEGRAM_API_ID)"
+        [[ "$REPLY" =~ ^[0-9]+$ ]] || die "api_id — это число"
+        env_set TELEGRAM_API_ID "$REPLY"
+        ask "api_hash" "$(env_get TELEGRAM_API_HASH)"
+        [[ "$REPLY" =~ ^[0-9a-f]{32}$ ]] || die "api_hash — это 32 символа 0-9a-f"
+        env_set TELEGRAM_API_HASH "$REPLY"
+        env_set COMPOSE_FILE "docker-compose.yml:docker-compose.local-api.yml"
+        if [[ "$(env_get LOCAL_API_LOGGED_OUT)" != 1 ]]; then
+            info "Отключаю бота от api.telegram.org (нужно для своего сервера)…"
+            tg_logout_official "$token"
+            env_set LOCAL_API_LOGGED_OUT 1
+        fi
+    else
+        if [[ "$cur_mode" == 1 ]]; then
+            warn "Возврат на api.telegram.org: Telegram может не пускать бота до 10 минут."
+        fi
+        env_set COMPOSE_FILE "docker-compose.yml"
+        env_unset LOCAL_API_LOGGED_OUT
+    fi
+
+    # --- качество
+    echo
+    local height conc
+    height="$(env_get MAX_HEIGHT)"
+    conc="$(env_get MAX_CONCURRENT)"
+    ask "Максимальное качество видео (360/480/720/1080/1440/2160)" "${height:-1080}"
+    [[ "$REPLY" =~ ^[0-9]+$ ]] || REPLY=1080
+    env_set MAX_HEIGHT "$REPLY"
+
+    ask "Сколько загрузок одновременно" "${conc:-3}"
+    [[ "$REPLY" =~ ^[0-9]+$ ]] || REPLY=3
+    env_set MAX_CONCURRENT "$REPLY"
+
+    # Значения по умолчанию, если их ещё нет.
+    [[ -n "$(env_get MAX_DOWNLOAD_MB)" ]] || env_set MAX_DOWNLOAD_MB 20000
+    if [[ -f "$DATA_DIR/cookies.txt" ]]; then env_set COOKIES_FILE /data/cookies.txt; fi
+
+    ok "Настройки сохранены в $ENV_FILE"
+}
+
+# ---------------------------------------------------------------- действия
+
+build_and_start() {
+    info "Собираю и запускаю (первый раз может занять пару минут)…"
+    compose build --pull --build-arg "DEPS_REFRESH=$(date +%s)"
+    compose up -d --remove-orphans
+    sleep 3
+    if compose ps --status running --services 2>/dev/null | grep -qx bot; then
+        ok "Бот запущен"
+    else
+        warn "Бот не запустился, последние логи:"
+        compose logs --tail 30 bot || true
+    fi
+}
+
+cmd_install() {
+    need_root install
+    ensure_docker
+    mkdir -p "$DATA_DIR"
+    chmod +x "$APP_DIR/videobot"
+    ln -sf "$APP_DIR/videobot" "$LINK"
+    if [[ -n "$(env_get BOT_TOKEN)" ]] && ! confirm "Бот уже настроен. Изменить настройки?" n; then
+        :
+    else
+        configure
+    fi
+    build_and_start
+    echo
+    ok "${B}Готово!${N} Напиши своему боту ссылку в Telegram."
+    echo "   Меню управления: ${B}videobot${N}"
+    echo "   Обновление:      ${B}videobot update${N}"
+}
+
+cmd_update() {
+    need_root update
+    info "Скачиваю новую версию…"
+    local branch
+    branch="$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD)"
+    local before after
+    before="$(git -C "$APP_DIR" rev-parse HEAD)"
+    git -C "$APP_DIR" fetch --quiet origin "$branch"
+    git -C "$APP_DIR" reset --quiet --hard "origin/$branch"
+    after="$(git -C "$APP_DIR" rev-parse HEAD)"
+    if [[ "$before" == "$after" ]]; then
+        ok "Код бота уже последней версии"
+    else
+        ok "Код обновлён: ${before:0:7} → ${after:0:7}"
+        git -C "$APP_DIR" log --oneline "$before..$after" | sed 's/^/   /'
+    fi
+    chmod +x "$APP_DIR/videobot"
+    info "Обновляю yt-dlp, gallery-dl и образы…"
+    compose pull --quiet --ignore-buildable 2>/dev/null || compose pull --quiet 2>/dev/null || true
+    build_and_start
+    docker image prune -f >/dev/null 2>&1 || true
+}
+
+cmd_status() {
+    echo "${B}Состояние:${N}"
+    compose ps
+    echo
+    local mode="до 50 МБ (api.telegram.org)"
+    [[ "$(env_get COMPOSE_FILE)" == *local-api* ]] && mode="до 2 ГБ (свой сервер Bot API)"
+    echo "Размер файлов: $mode"
+    echo "Качество:      до $(env_get MAX_HEIGHT)p"
+    echo "Cookies:       $([[ -f "$DATA_DIR/cookies.txt" ]] && echo есть || echo нет)"
+    echo "Автообновление: $([[ -f "$CRON_FILE" ]] && echo включено || echo выключено)"
+    echo "Версия:        $(git -C "$APP_DIR" log -1 --format='%h от %cd' --date=short)"
+    echo "Свободно места: $(df -h "$APP_DIR" | awk 'NR==2 {print $4}')"
+}
+
+cmd_cookies() {
+    need_root cookies
+    echo "Cookies нужны для Instagram, YouTube на сервере и 18+ контента."
+    echo "Экспортируй их из браузера расширением «Get cookies.txt LOCALLY»"
+    echo "и загрузи файл на сервер (например, через scp)."
+    echo
+    ask "Путь к cookies.txt (пусто — удалить текущие)"
+    mkdir -p "$DATA_DIR"
+    if [[ -z "$REPLY" ]]; then
+        rm -f "$DATA_DIR/cookies.txt"
+        env_unset COOKIES_FILE
+        ok "Cookies удалены"
+    else
+        [[ -f "$REPLY" ]] || die "Файл не найден: $REPLY"
+        cp "$REPLY" "$DATA_DIR/cookies.txt"
+        chmod 666 "$DATA_DIR/cookies.txt"
+        env_set COOKIES_FILE /data/cookies.txt
+        ok "Cookies сохранены"
+    fi
+    compose up -d
+}
+
+cmd_autoupdate() {
+    need_root autoupdate
+    if [[ -f "$CRON_FILE" ]]; then
+        if confirm "Автообновление включено. Выключить?" y; then
+            rm -f "$CRON_FILE"
+            ok "Автообновление выключено"
+        fi
+    else
+        if confirm "Обновлять бота и yt-dlp автоматически каждую ночь в 04:17?" y; then
+            echo "17 4 * * * root $LINK update >/var/log/videobot-update.log 2>&1" >"$CRON_FILE"
+            ok "Автообновление включено (лог: /var/log/videobot-update.log)"
+        fi
+    fi
+}
+
+cmd_uninstall() {
+    need_root uninstall
+    confirm "Точно удалить бота, его контейнеры и настройки?" n || return 0
+    compose down -v --rmi local || true
+    rm -f "$LINK" "$CRON_FILE"
+    rm -rf "$APP_DIR"
+    ok "Бот удалён"
+    exit 0
+}
+
+menu() {
+    while true; do
+        echo
+        echo "${B}🎬 Video Downloader Bot${N}"
+        local state="${R}остановлен${N}"
+        compose ps --status running --services 2>/dev/null | grep -qx bot && state="${G}работает${N}"
+        echo "   Состояние: $state"
+        echo
+        echo "  1) Статус"
+        echo "  2) Логи (выход — Ctrl+C)"
+        echo "  3) Перезапустить"
+        echo "  4) Остановить"
+        echo "  5) Запустить"
+        echo "  6) ${B}Обновить${N} бота и yt-dlp"
+        echo "  7) Настройки (токен, режим, качество)"
+        echo "  8) Cookies (Instagram, YouTube, 18+)"
+        echo "  9) Автообновление по ночам"
+        echo " 10) Удалить бота"
+        echo "  0) Выход"
+        ask "Выбери пункт"
+        echo
+        case "$REPLY" in
+            1) cmd_status ;;
+            2) compose logs -f --tail 100 bot || true ;;
+            3) compose restart && ok "Перезапущен" ;;
+            4) compose stop && ok "Остановлен" ;;
+            5) compose up -d && ok "Запущен" ;;
+            6) cmd_update ;;
+            7) configure && build_and_start ;;
+            8) cmd_cookies ;;
+            9) cmd_autoupdate ;;
+            10) cmd_uninstall ;;
+            0|q|"") exit 0 ;;
+            *) warn "Нет такого пункта" ;;
+        esac
+    done
+}
+
+case "${1:-menu}" in
+    menu) menu ;;
+    install) cmd_install ;;
+    update) cmd_update ;;
+    status) cmd_status ;;
+    logs) compose logs -f --tail 100 bot ;;
+    restart) compose restart ;;
+    start) compose up -d ;;
+    stop) compose stop ;;
+    config) configure && build_and_start ;;
+    cookies) cmd_cookies ;;
+    autoupdate) cmd_autoupdate ;;
+    uninstall) cmd_uninstall ;;
+    -h|--help|help)
+        sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "Неизвестная команда: $1 (см. videobot help)" ;;
+esac

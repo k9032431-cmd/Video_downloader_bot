@@ -3,6 +3,7 @@ import html
 import logging
 import re
 import secrets
+import shutil
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -347,6 +348,8 @@ async def main() -> None:
     if not config.BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан (см. .env.example)")
 
+    # Остатки незавершённых загрузок после падения/перезапуска.
+    shutil.rmtree(config.DOWNLOAD_DIR, ignore_errors=True)
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     bot = make_bot()
     log.info(
