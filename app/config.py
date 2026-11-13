@@ -38,3 +38,17 @@ MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_MB", "20000")) * MB
 MAX_HEIGHT = int(os.environ.get("MAX_HEIGHT", "1080"))
 # Сколько ждать ответа Telegram на отправку большого файла (секунды).
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "3600"))
+
+# ---- Раздача больших файлов ссылкой (работает без api_id)
+# Публичный адрес сервера, например http://203.0.113.5:8080. Пусто — режим выключен.
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or "").rstrip("/") or None
+# Порт встроенного веб-сервера внутри контейнера/процесса.
+WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))
+# Что делать с файлами больше лимита Telegram: link — дать ссылку, split — резать на части.
+LARGE_FILE_MODE = os.environ.get("LARGE_FILE_MODE") or ("link" if PUBLIC_URL else "split")
+if LARGE_FILE_MODE == "link" and not PUBLIC_URL:
+    LARGE_FILE_MODE = "split"
+# Сколько живёт ссылка на файл (часы).
+LINK_TTL_HOURS = float(os.environ.get("LINK_TTL_HOURS", "24"))
+# Папка для раздаваемых файлов (в том же томе, чтобы перенос был мгновенным).
+SHARE_DIR = DOWNLOAD_DIR / "_shared"

@@ -150,17 +150,24 @@ configure() {
 
     # --- режим
     echo
-    echo "Размер файлов, которые бот сможет отправлять:"
-    echo "  ${B}1${N}) до 2 ГБ — свой сервер Bot API ${G}(рекомендуется, для фильмов)${N}"
+    echo "Как отправлять большие видео (фильмы):"
+    echo "  ${B}1${N}) До 50 МБ — в Telegram, больше — ${B}ссылкой${N} на скачивание с этого сервера"
+    echo "     ничего не нужно, фильмы в полном качестве смотрятся прямо в браузере"
+    echo "  ${B}2${N}) До 2 ГБ — в Telegram через свой сервер Bot API"
     echo "     нужны api_id и api_hash с https://my.telegram.org → API development tools"
-    echo "  ${B}2${N}) до 50 МБ — обычный api.telegram.org, ничего больше не нужно"
+    echo "  ${B}3${N}) Только Telegram, до 50 МБ — большие режутся на много частей"
     local cur_mode=1 compose_file
     compose_file="$(env_get COMPOSE_FILE)"
-    [[ -n "$compose_file" && "$compose_file" != *local-api* ]] && cur_mode=2
+    if [[ "$compose_file" == *local-api* ]]; then
+        cur_mode=2
+    elif [[ -n "$compose_file" && "$(env_get LARGE_FILE_MODE)" != link ]]; then
+        cur_mode=3
+    fi
     ask "Выбери режим" "$cur_mode"
-    local mode="$REPLY"
+    local mode="$REPLY" use_links=0
+    [[ "$mode" =~ ^[123]$ ]] || mode=1
 
-    if [[ "$mode" == 1 ]]; then
+    if [[ "$mode" == 2 ]]; then
         ask "api_id" "$(env_get TELEGRAM_API_ID)"
         [[ "$REPLY" =~ ^[0-9]+$ ]] || die "api_id — это число"
         env_set TELEGRAM_API_ID "$REPLY"
@@ -173,12 +180,23 @@ configure() {
             tg_logout_official "$token"
             env_set LOCAL_API_LOGGED_OUT 1
         fi
+        local def=n
+        [[ "$(env_get LARGE_FILE_MODE)" == link ]] && def=y
+        confirm "Файлы больше 2 ГБ отдавать ссылкой (иначе — частями)?" "$def" && use_links=1
     else
-        if [[ "$cur_mode" == 1 ]]; then
+        if [[ "$cur_mode" == 2 ]]; then
             warn "Возврат на api.telegram.org: Telegram может не пускать бота до 10 минут."
         fi
         env_set COMPOSE_FILE "docker-compose.yml"
         env_unset LOCAL_API_LOGGED_OUT
+        [[ "$mode" == 1 ]] && use_links=1
+    fi
+
+    if [[ "$use_links" == 1 ]]; then
+        configure_links
+    else
+        env_set LARGE_FILE_MODE split
+        env_unset PUBLIC_URL
     fi
 
     # --- качество
@@ -199,6 +217,38 @@ configure() {
     if [[ -f "$DATA_DIR/cookies.txt" ]]; then env_set COOKIES_FILE /data/cookies.txt; fi
 
     ok "Настройки сохранены в $ENV_FILE"
+}
+
+configure_links() {
+    local port ip url
+    port="$(env_get WEB_PUBLIC_PORT)"
+    ask "Порт для ссылок на файлы" "${port:-8080}"
+    [[ "$REPLY" =~ ^[0-9]+$ ]] || REPLY=8080
+    port="$REPLY"
+    env_set WEB_PUBLIC_PORT "$port"
+
+    url="$(env_get PUBLIC_URL)"
+    if [[ -z "$url" ]]; then
+        ip="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+        url="http://$ip:$port"
+    fi
+    echo "Адрес, по которому файлы будут открываться (IP сервера или домен):"
+    ask "Адрес" "$url"
+    url="${REPLY%/}"
+    [[ "$url" =~ ^https?:// ]] || url="http://$url"
+    env_set PUBLIC_URL "$url"
+    env_set LARGE_FILE_MODE link
+
+    local ttl
+    ttl="$(env_get LINK_TTL_HOURS)"
+    ask "Сколько часов хранить файл по ссылке" "${ttl:-24}"
+    [[ "$REPLY" =~ ^[0-9]+$ ]] || REPLY=24
+    env_set LINK_TTL_HOURS "$REPLY"
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$port/tcp" >/dev/null && ok "Порт $port открыт в ufw"
+    fi
+    warn "Если у хостера есть свой фаервол (Security Group и т.п.) — открой там порт $port/tcp."
 }
 
 # ---------------------------------------------------------------- действия
@@ -264,6 +314,12 @@ cmd_status() {
     local mode="до 50 МБ (api.telegram.org)"
     [[ "$(env_get COMPOSE_FILE)" == *local-api* ]] && mode="до 2 ГБ (свой сервер Bot API)"
     echo "Размер файлов: $mode"
+    if [[ "$(env_get LARGE_FILE_MODE)" == link ]]; then
+        echo "Большие файлы: ссылкой через $(env_get PUBLIC_URL) ($(env_get LINK_TTL_HOURS) ч)"
+        echo "               сейчас раздаётся: $(compose exec -T bot sh -c 'du -sh /downloads/_shared 2>/dev/null | cut -f1' 2>/dev/null || echo ?)"
+    else
+        echo "Большие файлы: частями"
+    fi
     echo "Качество:      до $(env_get MAX_HEIGHT)p"
     echo "Cookies:       $([[ -f "$DATA_DIR/cookies.txt" ]] && echo есть || echo нет)"
     echo "Автообновление: $([[ -f "$CRON_FILE" ]] && echo включено || echo выключено)"

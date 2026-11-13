@@ -27,6 +27,7 @@ from aiogram.types import (
 
 from . import config
 from .downloader import DownloadError, DownloadResult, MediaFile, download, split_media
+from .share import share_file, start_web_server
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ HELP_TEXT = (
     "Reddit, SoundCloud и ещё сотни сайтов.\n\n"
     "Под каждым видео есть кнопка «🎵 Аудио» — она пришлёт звук в mp3.\n"
     "Команда /audio &lt;ссылка&gt; — сразу скачать mp3.\n\n"
-    "Большие видео (фильмы) я присылаю частями."
+    "Большие видео (фильмы) я присылаю частями или ссылкой на скачивание."
 )
 
 dp = Dispatcher()
@@ -143,6 +144,19 @@ async def split_big_files(result: DownloadResult, status: Status) -> None:
         else:
             files.append(f)
     result.files = files
+
+
+def share_big_files(result: DownloadResult) -> list[tuple[str, int]]:
+    """Файлы больше лимита уходят в раздачу по ссылке, остальные — в Telegram."""
+    links, keep = [], []
+    for f in result.files:
+        if f.size > config.MAX_UPLOAD_BYTES:
+            size = f.size
+            links.append((share_file(f.path, result.title), size))
+        else:
+            keep.append(f)
+    result.files = keep
+    return links
 
 
 async def send_video(message: Message, f: MediaFile, caption: str | None, markup=None) -> None:
@@ -251,9 +265,10 @@ async def process(message: Message, url: str, audio: bool) -> None:
     try:
         async with semaphore:
             status.start()
-            # С обычным Bot API (50 МБ) сначала пробуем качество пониже,
-            # с локальным сервером (2 ГБ) качаем в максимальном и режем при необходимости.
-            heights = [config.MAX_HEIGHT] if (audio or config.BOT_API_URL) else [720, 480]
+            # С обычным Bot API (50 МБ) и нарезкой сначала пробуем качество пониже.
+            # Со своим сервером (2 ГБ) или раздачей ссылкой — сразу максимальное.
+            full_quality = audio or config.BOT_API_URL or config.LARGE_FILE_MODE == "link"
+            heights = [config.MAX_HEIGHT] if full_quality else [720, 480]
             for h in heights:
                 if result:
                     result.cleanup()
@@ -265,9 +280,21 @@ async def process(message: Message, url: str, audio: bool) -> None:
             status.stop()
 
             assert result is not None
-            await split_big_files(result, status)
+            links = share_big_files(result) if config.LARGE_FILE_MODE == "link" else []
+            if not links:
+                await split_big_files(result, status)
             await status.set("⏫ Отправляю…")
-            await send_result(message, result, url)
+            if result.files:
+                await send_result(message, result, url)
+            for link, size in links:
+                await message.answer(
+                    f"🎬 <b>{html.escape(short_title(result) or 'Файл')}</b>\n"
+                    f"Размер {human_size(size)} — больше лимита Telegram, поэтому ссылкой:\n\n"
+                    f"▶️ <a href=\"{html.escape(link)}\">Смотреть</a>  ·  "
+                    f"⬇️ <a href=\"{html.escape(link)}?dl=1\">Скачать</a>\n\n"
+                    f"<i>Ссылка работает {config.LINK_TTL_HOURS:g} ч.</i>",
+                    disable_web_page_preview=True,
+                )
         await status.message.delete()
     except DownloadError as e:
         log.warning("Download failed: %s — %s", url, e)
@@ -349,12 +376,18 @@ async def main() -> None:
         raise SystemExit("BOT_TOKEN не задан (см. .env.example)")
 
     # Остатки незавершённых загрузок после падения/перезапуска.
-    shutil.rmtree(config.DOWNLOAD_DIR, ignore_errors=True)
+    # Раздаваемые по ссылке файлы (_shared) не трогаем — они удаляются по сроку.
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    for item in config.DOWNLOAD_DIR.iterdir():
+        if item != config.SHARE_DIR:
+            shutil.rmtree(item, ignore_errors=True)
+    if config.LARGE_FILE_MODE == "link":
+        await start_web_server()
     bot = make_bot()
     log.info(
-        "Bot started: api=%s, file limit %s",
+        "Bot started: api=%s, file limit %s, large files: %s",
         config.BOT_API_URL or "api.telegram.org", human_size(config.MAX_UPLOAD_BYTES),
+        config.LARGE_FILE_MODE,
     )
     # Не обрабатываем ссылки, накопившиеся пока бот был выключен.
     await bot.delete_webhook(drop_pending_updates=True)
