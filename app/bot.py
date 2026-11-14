@@ -85,6 +85,36 @@ def input_file(path: Path) -> FSInputFile | str:
     return FSInputFile(path)
 
 
+# ---------------------------------------------------------------- ошибки
+
+_ERROR_HINTS = [
+    (("sign in", "log in", "login", "cookies", "confirm you"),
+     "Сайт требует вход в аккаунт. Добавь cookies: <code>sudo videobot cookies</code>"),
+    (("private", "not available", "unavailable", "removed", "does not exist", "404"),
+     "Видео удалено, приватное или недоступно в стране сервера."),
+    (("unsupported url",), "Этот сайт не поддерживается."),
+    (("http error 403", "http error 474", "http error 429", "blocked", "too many requests", "rate limit"),
+     "Сайт не пускает сервер (блокировка по IP или слишком много запросов). "
+     "Попробуй позже или обнови: <code>sudo videobot update</code>"),
+    (("geo",), "Видео недоступно в стране сервера."),
+]
+
+
+def explain_error(raw: str) -> str:
+    if "слишком большой" in raw:
+        return f"❌ {html.escape(raw)}"
+    low = raw.lower()
+    hint = next((h for keys, h in _ERROR_HINTS if any(k in low for k in keys)), None)
+    # Первая строка от yt-dlp без служебного префикса «ERROR: [site] id:».
+    reason = raw.strip().splitlines()[0] if raw.strip() else "неизвестная ошибка"
+    reason = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*[^:]+:\s*)?", "", reason)
+    reason = re.sub(r"\s*;?\s*please report this issue.*$", "", reason, flags=re.I)[:300]
+    text = "❌ Не получилось скачать по этой ссылке."
+    if hint:
+        text += f"\n\n💡 {hint}"
+    return text + f"\n\n<i>Причина: {html.escape(reason)}</i>"
+
+
 # ---------------------------------------------------------------- статус и прогресс
 
 class Status:
@@ -298,13 +328,7 @@ async def process(message: Message, url: str, audio: bool) -> None:
         await status.message.delete()
     except DownloadError as e:
         log.warning("Download failed: %s — %s", url, e)
-        text = str(e)
-        if "слишком большой" not in text:
-            text = (
-                "❌ Не получилось скачать по этой ссылке.\n"
-                "Проверь, что пост публичный, или попробуй позже."
-            )
-        await status.set(text)
+        await status.set(explain_error(str(e)))
     except TelegramBadRequest as e:
         log.exception("Telegram error for %s", url)
         await status.set(f"❌ Telegram не принял файл: {html.escape(e.message)}")

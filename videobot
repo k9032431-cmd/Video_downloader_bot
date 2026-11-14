@@ -374,6 +374,24 @@ cmd_uninstall() {
     exit 0
 }
 
+cmd_test() {  # проверить ссылку прямо на сервере, с подробным выводом
+    local url="${1:-}"
+    if [[ -z "$url" ]]; then ask "Ссылка для проверки"; url="$REPLY"; fi
+    [[ -n "$url" ]] || return 0
+    info "yt-dlp $(compose exec -T bot yt-dlp --version 2>/dev/null || echo '?'), проверяю…"
+    compose exec -T bot yt-dlp --simulate --no-playlist -v "$url" 2>&1 \
+        | grep -vE '^\[debug\] (Encodings|exe versions|Proxy map|Plugin|Loaded|Request Handlers|Optional libraries|Python)' \
+        | tail -25 || true
+    echo
+    info "Скачиваю пробный кусок (до 3 МБ)…"
+    if compose exec -T bot sh -c 'cd /tmp && rm -f vbtest.* && yt-dlp --no-playlist -o "vbtest.%(ext)s" --max-filesize 3M -f "worst/b" "$0" >/dev/null 2>/tmp/vbtest.err; code=$?; cat /tmp/vbtest.err | tail -3; ls vbtest.* >/dev/null 2>&1 && exit 0; exit $code' "$url"; then
+        ok "Видео скачивается с этого сервера"
+    else
+        warn "Скачать не удалось — пришли этот вывод разработчику"
+    fi
+    compose exec -T bot sh -c 'rm -f /tmp/vbtest.*' >/dev/null 2>&1 || true
+}
+
 menu() {
     while true; do
         echo
@@ -384,6 +402,7 @@ menu() {
         echo
         echo "  1) Статус"
         echo "  2) Логи (выход — Ctrl+C)"
+        echo " 11) Проверить ссылку (диагностика)"
         echo "  3) Перезапустить"
         echo "  4) Остановить"
         echo "  5) Запустить"
@@ -406,6 +425,7 @@ menu() {
             8) cmd_cookies ;;
             9) cmd_autoupdate ;;
             10) cmd_uninstall ;;
+            11) cmd_test "" ;;
             0|q|"") exit 0 ;;
             *) warn "Нет такого пункта" ;;
         esac
@@ -418,6 +438,7 @@ case "${1:-menu}" in
     update) cmd_update ;;
     status) cmd_status ;;
     logs) compose logs -f --tail 100 bot ;;
+    test) shift; cmd_test "${1:-}" ;;
     restart) compose restart ;;
     start) compose up -d ;;
     stop) compose stop ;;
